@@ -1,81 +1,114 @@
-name: France Windows (Self-hosted) + Tailscale
+
+name: RDP
 
 on:
   workflow_dispatch:
 
-concurrency:
-  group: france-windows-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  france-windows:
-    # IMPORTANT:
-    # Use this to avoid "Waiting for a runner..." if your runner doesn't have the 'france' label yet.
-    # Once you add the 'france' label to your runner in GitHub settings, you can change this to:
-    # runs-on: [self-hosted, windows, france]
-    runs-on: [self-hosted, windows]
-
-    timeout-minutes: 120
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Show runner info
-        shell: pwsh
+      - name: Configure Core RDP Settings
         run: |
-          Write-Host "Runner: $env:COMPUTERNAME"
-          Write-Host "OS: $([System.Environment]::OSVersion.VersionString)"
-          Write-Host "User: $env:USERNAME"
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Verify runner egress country is France (FR)
-        shell: pwsh
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
         run: |
-          try {
-            $ipObj = Invoke-RestMethod "https://api.ipify.org?format=json" -TimeoutSec 15
-            $ip = $ipObj.ip
-            Write-Host "Public IP: $ip"
-
-            $geo = Invoke-RestMethod "https://ipinfo.io/$ip/json" -TimeoutSec 15
-            Write-Host "Geo: country=$($geo.country) region=$($geo.region) city=$($geo.city) org=$($geo.org)"
-
-            if ($geo.country -ne "FR") {
-              throw "This runner's public egress is '$($geo.country)' (expected 'FR'). Move the runner to a France region or use a France exit node."
-            }
-          } catch {
-            throw "Geo check failed: $($_.Exception.Message)"
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-      - name: Ensure Tailscale is installed
-        shell: pwsh
+      - name: Install Tailscale
         run: |
-          $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          if (-not (Test-Path $ts)) {
-            throw "Tailscale not found at $ts. Install Tailscale once on this VM, then rerun."
-          }
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      - name: Bring up Tailscale (optional FR exit node)
-        shell: pwsh
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          # Optional: set this secret to a France exit-node name or IP (leave empty to skip)
-          TS_EXIT_NODE: ${{ secrets.TAILSCALE_EXIT_NODE }}
+      - name: Establish Tailscale Connection
         run: |
-          $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-
-          if (-not $env:TS_AUTHKEY) { throw "Missing secrets.TAILSCALE_AUTH_KEY" }
-
-          # Bring up Tailscale (idempotent-ish)
-          if ($env:TS_EXIT_NODE) {
-            Write-Host "Using exit node: $env:TS_EXIT_NODE"
-            & $ts up --authkey=$env:TS_AUTHKEY --hostname=fr-gh-runner-${{ github.run_id }} --exit-node=$env:TS_EXIT_NODE --exit-node-allow-lan-access=false
-          } else {
-            & $ts up --authkey=$env:TS_AUTHKEY --hostname=fr-gh-runner-${{ github.run_id }}
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-
-          $ip = (& $ts ip -4).Trim()
-          if (-not $ip) { throw "Failed to get Tailscale IPv4" }
-
-          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Output Tailscale IP (connect to this)
-        shell: pwsh
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
