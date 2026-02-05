@@ -1,50 +1,81 @@
-name: France Runner (Tailscale)
+name: France Windows (Self-hosted) + Tailscale
 
 on:
   workflow_dispatch:
 
+concurrency:
+  group: france-windows-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   france-windows:
-    runs-on: [self-hosted, windows, france]
+    # IMPORTANT:
+    # Use this to avoid "Waiting for a runner..." if your runner doesn't have the 'france' label yet.
+    # Once you add the 'france' label to your runner in GitHub settings, you can change this to:
+    # runs-on: [self-hosted, windows, france]
+    runs-on: [self-hosted, windows]
+
     timeout-minutes: 120
 
     steps:
       - name: Show runner info
         shell: pwsh
         run: |
-          Write-Host "Hostname: $(hostname)"
-          Write-Host "OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
-          Write-Host "Timezone: $((Get-TimeZone).Id)"
+          Write-Host "Runner: $env:COMPUTERNAME"
+          Write-Host "OS: $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "User: $env:USERNAME"
+
+      - name: Verify runner egress country is France (FR)
+        shell: pwsh
+        run: |
+          try {
+            $ipObj = Invoke-RestMethod "https://api.ipify.org?format=json" -TimeoutSec 15
+            $ip = $ipObj.ip
+            Write-Host "Public IP: $ip"
+
+            $geo = Invoke-RestMethod "https://ipinfo.io/$ip/json" -TimeoutSec 15
+            Write-Host "Geo: country=$($geo.country) region=$($geo.region) city=$($geo.city) org=$($geo.org)"
+
+            if ($geo.country -ne "FR") {
+              throw "This runner's public egress is '$($geo.country)' (expected 'FR'). Move the runner to a France region or use a France exit node."
+            }
+          } catch {
+            throw "Geo check failed: $($_.Exception.Message)"
+          }
 
       - name: Ensure Tailscale is installed
         shell: pwsh
         run: |
           $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
           if (-not (Test-Path $ts)) {
-            throw "Tailscale is not installed on this self-hosted runner. Install it once on the VM, then rerun."
+            throw "Tailscale not found at $ts. Install Tailscale once on this VM, then rerun."
           }
 
-      - name: Bring up Tailscale (idempotent)
+      - name: Bring up Tailscale (optional FR exit node)
         shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          # Optional: set this secret to a France exit-node name or IP (leave empty to skip)
+          TS_EXIT_NODE: ${{ secrets.TAILSCALE_EXIT_NODE }}
         run: |
           $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
 
-          # If already logged in/connected, don't disrupt it
-          $statusJson = & $ts status --json 2>$null
-          if ($LASTEXITCODE -ne 0 -or -not $statusJson) {
-            Write-Host "Tailscale not up yet. Bringing it up..."
-            & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=fr-gh-runner-${{ github.run_id }}
+          if (-not $env:TS_AUTHKEY) { throw "Missing secrets.TAILSCALE_AUTH_KEY" }
+
+          # Bring up Tailscale (idempotent-ish)
+          if ($env:TS_EXIT_NODE) {
+            Write-Host "Using exit node: $env:TS_EXIT_NODE"
+            & $ts up --authkey=$env:TS_AUTHKEY --hostname=fr-gh-runner-${{ github.run_id }} --exit-node=$env:TS_EXIT_NODE --exit-node-allow-lan-access=false
           } else {
-            Write-Host "Tailscale already up."
+            & $ts up --authkey=$env:TS_AUTHKEY --hostname=fr-gh-runner-${{ github.run_id }}
           }
 
           $ip = (& $ts ip -4).Trim()
-          if (-not $ip) { throw "Failed to obtain Tailscale IPv4." }
+          if (-not $ip) { throw "Failed to get Tailscale IPv4" }
 
           "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Show Tailscale IP (use this to RDP over Tailnet)
+      - name: Output Tailscale IP (connect to this)
         shell: pwsh
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "RDP tip: connect to $env:TAILSCALE_IP:3389 from a device on the same Tailnet"
